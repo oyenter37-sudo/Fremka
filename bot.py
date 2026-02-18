@@ -19,17 +19,17 @@ from aiogram.types import (
 #  Конфиг
 # ─────────────────────────────────────────────
 TOKEN = "8500266882:AAHTGpChTbUZ-CJ-GydZAWmlGBlshiK5UNk"
-ADMINS = {"asd123dad", "venter8"}          # username без @
+ADMINS = {"asd123dad", "venter8"}
 DEFAULT_EMOJI_ID = "5285430309720966085"
 DEFAULT_EMOJI_NAME = "Стандартный"
-MAX_ADDITIONS = 5                           # дополнительных частей (не считая основной)
-NO_EMOJI = "__NO_EMOJI__"                   # sentinel — без эмодзи
+MAX_ADDITIONS = 5
+NO_EMOJI = "__NO_EMOJI__"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-#  База данных (SQLite in-memory)
+#  База данных
 # ─────────────────────────────────────────────
 con = sqlite3.connect(":memory:", check_same_thread=False)
 con.row_factory = sqlite3.Row
@@ -50,17 +50,14 @@ def db_init() -> None:
             added_at   TEXT
         );
     """)
-    # Начальный эмодзи
     cur.execute(
         "INSERT OR IGNORE INTO emoji_catalog VALUES (?,?,?,?)",
         (DEFAULT_EMOJI_ID, DEFAULT_EMOJI_NAME, "system", datetime.utcnow().isoformat()),
     )
     con.commit()
 
-
-def db_get_catalog() -> list[sqlite3.Row]:
+def db_get_catalog() -> list:
     return con.execute("SELECT * FROM emoji_catalog ORDER BY added_at").fetchall()
-
 
 def db_add_emoji(emoji_id: str, name: str, added_by: str) -> None:
     con.execute(
@@ -69,10 +66,8 @@ def db_add_emoji(emoji_id: str, name: str, added_by: str) -> None:
     )
     con.commit()
 
-
-def db_get_approvers() -> list[sqlite3.Row]:
+def db_get_approvers() -> list:
     return con.execute("SELECT * FROM approvers ORDER BY added_at").fetchall()
-
 
 def db_add_approver(user_id: int, username: str, added_by: str) -> None:
     con.execute(
@@ -81,17 +76,14 @@ def db_add_approver(user_id: int, username: str, added_by: str) -> None:
     )
     con.commit()
 
-
 def db_remove_approver(user_id: int) -> bool:
     cur = con.execute("DELETE FROM approvers WHERE user_id=?", (user_id,))
     con.commit()
     return cur.rowcount > 0
 
-
 def db_is_approver(user_id: int) -> bool:
     row = con.execute("SELECT 1 FROM approvers WHERE user_id=?", (user_id,)).fetchone()
     return row is not None
-
 
 def db_export() -> str:
     data = {
@@ -99,7 +91,6 @@ def db_export() -> str:
         "approvers":     [dict(r) for r in db_get_approvers()],
     }
     return "EMOJI_BACKUP:" + base64.b64encode(json.dumps(data).encode()).decode()
-
 
 def db_import(raw: str) -> bool:
     try:
@@ -123,17 +114,14 @@ def db_import(raw: str) -> bool:
         log.error("import error: %s", e)
         return False
 
-
 # ─────────────────────────────────────────────
-#  Сессии пользователей
+#  Сессии
 # ─────────────────────────────────────────────
 class Part:
     __slots__ = ("text", "emoji_id")
-
     def __init__(self, text: str, emoji_id: str = DEFAULT_EMOJI_ID):
         self.text = text
-        self.emoji_id = emoji_id          # или NO_EMOJI
-
+        self.emoji_id = emoji_id
 
 class Session:
     def __init__(self):
@@ -145,40 +133,35 @@ class Session:
         self.waiting_for_emoji_name: bool = False
         self.pending_emoji_id: Optional[str] = None
         self.last_message_id: Optional[int] = None
-        # сообщение-пагинатор (может отличаться от last_message_id)
         self.picker_message_id: Optional[int] = None
 
-
 sessions: dict[int, Session] = {}
-
 
 def get_session(user_id: int) -> Session:
     if user_id not in sessions:
         sessions[user_id] = Session()
     return sessions[user_id]
 
-
 # ─────────────────────────────────────────────
 #  Глобальные состояния admin
 # ─────────────────────────────────────────────
-admin_waiting_add:    set[int] = set()   # ждём username нового аппрувера
-admin_waiting_remove: set[int] = set()   # ждём user_id для удаления
-admin_waiting_down:   set[int] = set()   # ждём строку бэкапа
-
+admin_waiting_add:    set[int] = set()
+admin_waiting_remove: set[int] = set()
+admin_waiting_down:   set[int] = set()
 
 # ─────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────
 def is_admin(username: Optional[str]) -> bool:
-    return bool(username and username.lstrip("@") in ADMINS)
-
+    if not username:
+        return False
+    clean = username.lstrip("@").lower()
+    return clean in {a.lower() for a in ADMINS}
 
 def tg_emoji_tag(emoji_id: str, placeholder: str = "⭐") -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{placeholder}</tg-emoji>'
 
-
 def build_final_text(session: Session) -> str:
-    """Собираем итоговый текст из частей."""
     chunks: list[str] = []
     for part in session.parts:
         chunks.append(part.text)
@@ -186,18 +169,15 @@ def build_final_text(session: Session) -> str:
             chunks.append(tg_emoji_tag(part.emoji_id))
     return " ".join(chunks) if chunks else "..."
 
-
 # ─────────────────────────────────────────────
 #  Клавиатуры
 # ─────────────────────────────────────────────
 def build_editor_keyboard(session: Session) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-
     for i, part in enumerate(session.parts):
         label = "Основной" if i == 0 else f"Добавка {i}"
         has_emoji = part.emoji_id != NO_EMOJI
         emoji_icon = "✅" if has_emoji else "❌"
-
         rows.append([
             InlineKeyboardButton(
                 text=f"{emoji_icon} {label}",
@@ -208,8 +188,7 @@ def build_editor_keyboard(session: Session) -> InlineKeyboardMarkup:
                 callback_data=f"pick_emoji_{i}",
             ),
         ])
-
-    extras = len(session.parts) - 1          # сколько добавок уже есть
+    extras = len(session.parts) - 1
     if extras < MAX_ADDITIONS and not session.waiting_for_input:
         rows.append([
             InlineKeyboardButton(
@@ -217,32 +196,22 @@ def build_editor_keyboard(session: Session) -> InlineKeyboardMarkup:
                 callback_data="add",
             )
         ])
-
     if session.waiting_for_input:
         rows.append([
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
         ])
-
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def build_picker_keyboard(page: int) -> InlineKeyboardMarkup:
-    """Клавиатура выбора эмодзи."""
     catalog = db_get_catalog()
     total = len(catalog)
     per_page = 10
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-
     start = page * per_page
     items = catalog[start: start + per_page]
-
     rows: list[list[InlineKeyboardButton]] = []
-
-    # Кнопка «Без эмодзи»
     rows.append([InlineKeyboardButton(text="❌ Без эмодзи", callback_data="ep_none")])
-
-    # Кнопки выбора по 2 в ряд
     pair: list[InlineKeyboardButton] = []
     for local_idx, row in enumerate(items):
         num = local_idx + 1
@@ -256,8 +225,6 @@ def build_picker_keyboard(page: int) -> InlineKeyboardMarkup:
             pair = []
     if pair:
         rows.append(pair)
-
-    # Навигация
     nav: list[InlineKeyboardButton] = []
     nav.append(
         InlineKeyboardButton(
@@ -279,28 +246,21 @@ def build_picker_keyboard(page: int) -> InlineKeyboardMarkup:
     )
     rows.append(nav)
     rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="ep_close")])
-
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def build_picker_text(page: int) -> str:
-    """Текст сообщения выбора эмодзи."""
     catalog = db_get_catalog()
     per_page = 10
     total_pages = max(1, (len(catalog) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-
     start = page * per_page
     items = catalog[start: start + per_page]
-
     lines = ["🎭 <b>Выберите эмодзи:</b>\n"]
     for local_idx, row in enumerate(items):
         num = local_idx + 1
         preview = tg_emoji_tag(row["emoji_id"])
         lines.append(f"{num}. {preview} {row['name']}")
-
     return "\n".join(lines)
-
 
 def build_upuser_text() -> str:
     approvers = db_get_approvers()
@@ -313,13 +273,11 @@ def build_upuser_text() -> str:
         lines.append("• Список пуст")
     return "\n".join(lines)
 
-
 def build_upuser_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить аппрувера", callback_data="adm_add")],
         [InlineKeyboardButton(text="➖ Удалить аппрувера",  callback_data="adm_remove")],
     ])
-
 
 # ─────────────────────────────────────────────
 #  Bot + Dispatcher
@@ -327,9 +285,31 @@ def build_upuser_keyboard() -> InlineKeyboardMarkup:
 bot = Bot(token=TOKEN)
 dp  = Dispatcher()
 
+# ─────────────────────────────────────────────
+#  Вспомогательная: обновление редактора
+# ─────────────────────────────────────────────
+async def _refresh_editor(chat_id: int, session: Session) -> None:
+    text   = build_final_text(session)
+    markup = build_editor_keyboard(session)
+    if session.waiting_for_input:
+        text += "\n\n✏️ <i>Введи текст для добавки:</i>"
+    if session.last_message_id:
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=session.last_message_id,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    session.last_message_id = sent.message_id
 
 # ─────────────────────────────────────────────
-#  /start
+#  КОМАНДЫ — регистрируем ПЕРВЫМИ
 # ─────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
@@ -339,12 +319,15 @@ async def cmd_start(message: Message) -> None:
         parse_mode="HTML",
     )
 
-
-# ─────────────────────────────────────────────
-#  /upuser  (только для админов)
-# ─────────────────────────────────────────────
 @dp.message(Command("upuser"))
 async def cmd_upuser(message: Message) -> None:
+    log.info(
+        "upuser: user=%s username=%r admins=%r check=%s",
+        message.from_user.id,
+        message.from_user.username,
+        ADMINS,
+        is_admin(message.from_user.username),
+    )
     if not is_admin(message.from_user.username):
         await message.answer("⛔ Нет доступа.")
         return
@@ -354,44 +337,31 @@ async def cmd_upuser(message: Message) -> None:
         parse_mode="HTML",
     )
 
-
-# ─────────────────────────────────────────────
-#  /up  — экспорт
-# ─────────────────────────────────────────────
 @dp.message(Command("up"))
 async def cmd_up(message: Message) -> None:
     if not is_admin(message.from_user.username):
         await message.answer("⛔ Нет доступа.")
         return
     backup = db_export()
-    await message.answer(
-        f"📦 <b>Бэкап:</b>\n<code>{backup}</code>",
-        parse_mode="HTML",
-    )
+    await message.answer(f"📦 <b>Бэкап:</b>\n<code>{backup}</code>", parse_mode="HTML")
 
-
-# ─────────────────────────────────────────────
-#  /down  — начало импорта
-# ─────────────────────────────────────────────
 @dp.message(Command("down"))
 async def cmd_down(message: Message) -> None:
     if not is_admin(message.from_user.username):
         await message.answer("⛔ Нет доступа.")
         return
     admin_waiting_down.add(message.from_user.id)
-    await message.answer("📥 Отправь строку бэкапа (начинается с <code>EMOJI_BACKUP:</code>):", parse_mode="HTML")
+    await message.answer(
+        "📥 Отправь строку бэкапа (начинается с <code>EMOJI_BACKUP:</code>):",
+        parse_mode="HTML",
+    )
 
-
-# ─────────────────────────────────────────────
-#  /cancel  — глобальный
-# ─────────────────────────────────────────────
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message) -> None:
     uid = message.from_user.id
     admin_waiting_add.discard(uid)
     admin_waiting_remove.discard(uid)
     admin_waiting_down.discard(uid)
-
     session = get_session(uid)
     if session.waiting_for_input:
         session.waiting_for_input = False
@@ -400,13 +370,52 @@ async def cmd_cancel(message: Message) -> None:
     if session.waiting_for_emoji_name:
         session.waiting_for_emoji_name = False
         session.pending_emoji_id = None
-
     await message.answer("❌ Отменено.")
 
+# ─────────────────────────────────────────────
+#  Текстовые сообщения (НЕ команды)
+#  Два раздельных хендлера вместо одного общего
+# ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-#  Обработчик текстовых сообщений
-# ─────────────────────────────────────────────
+def _has_custom_emoji(message: Message) -> bool:
+    """Проверяем наличие custom_emoji entity."""
+    if not message.entities:
+        return False
+    return any(e.type == "custom_emoji" for e in message.entities)
+
+# Хендлер 1: сообщения с premium emoji
+@dp.message(F.text, F.func(_has_custom_emoji))
+async def on_premium_emoji(message: Message) -> None:
+    uid = message.from_user.id
+    session = get_session(uid)
+
+    custom_ids = [
+        e.custom_emoji_id
+        for e in message.entities
+        if e.type == "custom_emoji" and e.custom_emoji_id
+    ]
+    if not custom_ids:
+        return
+
+    emoji_id = custom_ids[0]
+
+    if db_is_approver(uid):
+        if session.waiting_for_emoji_name:
+            await message.answer("⏳ Сначала введи название для предыдущего эмодзи.")
+            return
+        session.pending_emoji_id = emoji_id
+        session.waiting_for_emoji_name = True
+        await message.answer(
+            f"🎭 Эмодзи получен: {tg_emoji_tag(emoji_id)}\n"
+            f"ID: <code>{emoji_id}</code>\n\n"
+            f"Введи название для каталога:",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.answer(f"ID: <code>{emoji_id}</code>", parse_mode="HTML")
+
+# Хендлер 2: обычный текст (без custom emoji)
 @dp.message(F.text)
 async def on_text(message: Message) -> None:
     uid      = message.from_user.id
@@ -414,30 +423,34 @@ async def on_text(message: Message) -> None:
     username = message.from_user.username or ""
     session  = get_session(uid)
 
-    # ── 1. Ожидание строки бэкапа (/down)
+    # 1. Ожидание строки бэкапа
     if uid in admin_waiting_down:
         admin_waiting_down.discard(uid)
         if db_import(text):
             await message.answer("✅ Бэкап восстановлен!")
         else:
-            await message.answer("❌ Ошибка формата. Начало должно быть <code>EMOJI_BACKUP:</code>", parse_mode="HTML")
+            await message.answer(
+                "❌ Ошибка формата. Начало должно быть <code>EMOJI_BACKUP:</code>",
+                parse_mode="HTML",
+            )
         return
 
-    # ── 2. Ожидание username нового аппрувера
+    # 2. Ожидание username нового аппрувера
     if uid in admin_waiting_add:
         admin_waiting_add.discard(uid)
         target_username = text.lstrip("@")
         await message.answer(
-            f"⚠️ Я не могу сам получить ID пользователя по username.\n"
-            f"Попроси <b>@{target_username}</b> написать боту — и добавь его командой из панели, "
-            f"указав числовой ID.",
+            f"⚠️ Я не могу получить ID пользователя по username автоматически.\n"
+            f"Попроси <b>@{target_username}</b> написать боту — узнай его числовой ID "
+            f"и добавь через панель, введя ID напрямую.\n\n"
+            f"Или введи сразу числовой ID через кнопку <b>«Добавить»</b> ещё раз — "
+            f"только сначала получи ID (например, из /upuser после того как человек напишет боту).",
             parse_mode="HTML",
         )
-        # Показываем панель снова
         await message.answer(build_upuser_text(), reply_markup=build_upuser_keyboard(), parse_mode="HTML")
         return
 
-    # ── 3. Ожидание ID для удаления аппрувера
+    # 3. Ожидание ID для удаления
     if uid in admin_waiting_remove:
         admin_waiting_remove.discard(uid)
         try:
@@ -452,7 +465,7 @@ async def on_text(message: Message) -> None:
         await message.answer(build_upuser_text(), reply_markup=build_upuser_keyboard(), parse_mode="HTML")
         return
 
-    # ── 4. Ожидание названия эмодзи (аппрувер добавляет в каталог)
+    # 4. Ожидание названия эмодзи (аппрувер)
     if session.waiting_for_emoji_name and session.pending_emoji_id:
         session.waiting_for_emoji_name = False
         emoji_id = session.pending_emoji_id
@@ -464,19 +477,19 @@ async def on_text(message: Message) -> None:
         )
         return
 
-    # ── 5. Ожидание текста добавки в редакторе
+    # 5. Ожидание текста добавки
     if session.waiting_for_input:
         session.parts.append(Part(text=text))
         session.waiting_for_input = False
         await _refresh_editor(message.chat.id, session)
         return
 
-    # ── 6. Новое сообщение → новый редактор
+    # 6. Новое сообщение → новый редактор
     session.parts = [Part(text=text)]
     session.waiting_for_input = False
-    session.selecting_emoji    = False
-    session.last_message_id    = None
-    session.picker_message_id  = None
+    session.selecting_emoji   = False
+    session.last_message_id   = None
+    session.picker_message_id = None
 
     sent = await message.answer(
         build_final_text(session),
@@ -484,56 +497,6 @@ async def on_text(message: Message) -> None:
         parse_mode="HTML",
     )
     session.last_message_id = sent.message_id
-
-
-# ─────────────────────────────────────────────
-#  Обработчик премиум-эмодзи (entities)
-# ─────────────────────────────────────────────
-@dp.message(F.content_type == "text")   # дублируем через entity-фильтр ниже
-async def _dummy(_: Message) -> None:
-    pass  # никогда не вызовется — нужен только как маркер
-
-
-@dp.message()
-async def on_any_message(message: Message) -> None:
-    """Ловим сообщения с premium emoji (custom_emoji entity)."""
-    if not message.entities:
-        return
-
-    uid = message.from_user.id
-    session = get_session(uid)
-
-    custom_ids = [
-        e.custom_emoji_id
-        for e in message.entities
-        if e.type == "custom_emoji" and e.custom_emoji_id
-    ]
-    if not custom_ids:
-        return
-
-    emoji_id = custom_ids[0]
-
-    # Аппрувер — предлагаем добавить в каталог
-    if db_is_approver(uid):
-        if session.waiting_for_emoji_name:
-            await message.answer("⏳ Сначала введи название для предыдущего эмодзи.")
-            return
-        session.pending_emoji_id   = emoji_id
-        session.waiting_for_emoji_name = True
-        await message.answer(
-            f"🎭 Эмодзи получен: {tg_emoji_tag(emoji_id)}\n"
-            f"ID: <code>{emoji_id}</code>\n\n"
-            f"Введи название для каталога:",
-            parse_mode="HTML",
-        )
-        return
-
-    # Обычный пользователь — просто показываем ID
-    await message.answer(
-        f"ID: <code>{emoji_id}</code>",
-        parse_mode="HTML",
-    )
-
 
 # ─────────────────────────────────────────────
 #  Callbacks
@@ -544,9 +507,8 @@ async def on_callback(query: CallbackQuery) -> None:
     data    = query.data
     chat_id = query.message.chat.id
     session = get_session(uid)
-    username = query.from_user.username or str(uid)
 
-    # ── Админ-панель ──────────────────────────────────────────────────────────
+    # Админ-панель
     if data == "adm_add":
         if not is_admin(query.from_user.username):
             await query.answer("⛔ Нет доступа.")
@@ -554,7 +516,8 @@ async def on_callback(query: CallbackQuery) -> None:
         admin_waiting_add.add(uid)
         await query.answer()
         await query.message.answer(
-            "👤 Введи <b>username</b> нового аппрувера (с @ или без):",
+            "👤 Введи числовой <b>user_id</b> нового аппрувера и его username через пробел.\n"
+            "Например: <code>123456789 username</code>",
             parse_mode="HTML",
         )
         return
@@ -571,7 +534,7 @@ async def on_callback(query: CallbackQuery) -> None:
         )
         return
 
-    # ── Эмодзи-пикер: навигация ──────────────────────────────────────────────
+    # Пикер: навигация
     if data.startswith("ep_page_"):
         new_page = int(data.split("_")[-1])
         session.emoji_page = new_page
@@ -588,13 +551,11 @@ async def on_callback(query: CallbackQuery) -> None:
         return
 
     if data == "ep_none":
-        # Убрать эмодзи для текущей части
         idx = session.current_part_index
         if 0 <= idx < len(session.parts):
             session.parts[idx].emoji_id = NO_EMOJI
         session.selecting_emoji = False
         await query.answer("❌ Эмодзи убран")
-        # Закрываем пикер и обновляем редактор
         await query.message.delete()
         session.picker_message_id = None
         await _refresh_editor(chat_id, session)
@@ -626,7 +587,7 @@ async def on_callback(query: CallbackQuery) -> None:
         await _refresh_editor(chat_id, session)
         return
 
-    # ── Редактор ─────────────────────────────────────────────────────────────
+    # Редактор
     if data == "add":
         extras = len(session.parts) - 1
         if extras >= MAX_ADDITIONS:
@@ -672,40 +633,6 @@ async def on_callback(query: CallbackQuery) -> None:
 
     await query.answer()
 
-
-# ─────────────────────────────────────────────
-#  Вспомогательная функция обновления редактора
-# ─────────────────────────────────────────────
-async def _refresh_editor(chat_id: int, session: Session) -> None:
-    """Редактирует существующее сообщение редактора или создаёт новое."""
-    text    = build_final_text(session)
-    markup  = build_editor_keyboard(session)
-
-    if session.waiting_for_input:
-        text += "\n\n✏️ <i>Введи текст для добавки:</i>"
-
-    if session.last_message_id:
-        try:
-            await bot.edit_message_text(
-                text=text,
-                chat_id=chat_id,
-                message_id=session.last_message_id,
-                reply_markup=markup,
-                parse_mode="HTML",
-            )
-            return
-        except Exception:
-            pass  # сообщение удалено — создадим новое
-
-    sent = await bot.send_message(
-        chat_id,
-        text,
-        reply_markup=markup,
-        parse_mode="HTML",
-    )
-    session.last_message_id = sent.message_id
-
-
 # ─────────────────────────────────────────────
 #  Точка входа
 # ─────────────────────────────────────────────
@@ -713,7 +640,6 @@ async def main() -> None:
     db_init()
     log.info("Bot started")
     await dp.start_polling(bot, skip_updates=True)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
