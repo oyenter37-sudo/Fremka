@@ -1,516 +1,719 @@
 import asyncio
-import json
 import base64
+import json
+import logging
 import sqlite3
-from typing import Dict, Optional, List
-from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Optional
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
-from aiogram.enums import ParseMode
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
-# ============ КОНФИГ ============
-TOKEN = '8500266882:AAHTGpChTbUZ-CJ-GydZAWmlGBlshiK5UNk'
-ADMIN_USERNAMES = {'asd123dad', 'venter8'}
-DEFAULT_EMOJI_ID = '5285430309720966085'
-MAX_ADDITIONS = 5
-EMOJI_PER_PAGE = 10
+# ─────────────────────────────────────────────
+#  Конфиг
+# ─────────────────────────────────────────────
+TOKEN = "8500266882:AAHTGpChTbUZ-CJ-GydZAWmlGBlshiK5UNk"
+ADMINS = {"asd123dad", "venter8"}          # username без @
+DEFAULT_EMOJI_ID = "5285430309720966085"
+DEFAULT_EMOJI_NAME = "Стандартный"
+MAX_ADDITIONS = 5                           # дополнительных частей (не считая основной)
+NO_EMOJI = "__NO_EMOJI__"                   # sentinel — без эмодзи
 
-# ============ БАЗА ДАННЫХ (SQLite в памяти) ============
-class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.init_tables()
-        self.init_default_data()
-    
-    def init_tables(self):
-        self.cursor.execute('''
-            CREATE TABLE emoji_catalog (
-                emoji_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                added_by INTEGER,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self.cursor.execute('''
-            CREATE TABLE approvers (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                added_by INTEGER,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        self.conn.commit()
-    
-    def init_default_data(self):
-        # Начальный каталог - только один эмодзи
-        self.cursor.execute(
-            'INSERT OR IGNORE INTO emoji_catalog (emoji_id, name, added_by) VALUES (?, ?, ?)',
-            (DEFAULT_EMOJI_ID, 'Стандартный 👍', 0)
-        )
-        self.conn.commit()
-    
-    def get_catalog(self) -> List[dict]:
-        self.cursor.execute('SELECT emoji_id, name FROM emoji_catalog ORDER BY added_at')
-        return [{'emoji_id': row[0], 'name': row[1]} for row in self.cursor.fetchall()]
-    
-    def add_emoji(self, emoji_id: str, name: str, user_id: int):
-        self.cursor.execute(
-            'INSERT OR REPLACE INTO emoji_catalog (emoji_id, name, added_by) VALUES (?, ?, ?)',
-            (emoji_id, name, user_id)
-        )
-        self.conn.commit()
-    
-    def remove_emoji(self, emoji_id: str):
-        self.cursor.execute('DELETE FROM emoji_catalog WHERE emoji_id = ?', (emoji_id,))
-        self.conn.commit()
-    
-    def is_approver(self, user_id: int) -> bool:
-        self.cursor.execute('SELECT 1 FROM approvers WHERE user_id = ?', (user_id,))
-        return self.cursor.fetchone() is not None
-    
-    def add_approver(self, user_id: int, username: str, added_by: int):
-        self.cursor.execute(
-            'INSERT OR REPLACE INTO approvers (user_id, username, added_by) VALUES (?, ?, ?)',
-            (user_id, username, added_by)
-        )
-        self.conn.commit()
-    
-    def remove_approver(self, user_id: int):
-        self.cursor.execute('DELETE FROM approvers WHERE user_id = ?', (user_id,))
-        self.conn.commit()
-    
-    def get_approvers(self) -> List[dict]:
-        self.cursor.execute('SELECT user_id, username FROM approvers')
-        return [{'user_id': row[0], 'username': row[1]} for row in self.cursor.fetchall()]
-    
-    def export_data(self) -> str:
-        catalog = self.get_catalog()
-        approvers = self.get_approvers()
-        data = {'catalog': catalog, 'approvers': approvers}
-        json_str = json.dumps(data, ensure_ascii=False)
-        return f"EMOJI_BACKUP:{base64.b64encode(json_str.encode()).decode()}"
-    
-    def import_data(self, data_str: str) -> bool:
-        try:
-            if not data_str.startswith('EMOJI_BACKUP:'):
-                return False
-            encoded = data_str.split(':', 1)[1]
-            decoded = base64.b64decode(encoded).decode()
-            data = json.loads(decoded)
-            
-            # Очищаем и восстанавливаем
-            self.cursor.execute('DELETE FROM emoji_catalog')
-            self.cursor.execute('DELETE FROM approvers')
-            
-            for item in data.get('catalog', []):
-                self.cursor.execute(
-                    'INSERT INTO emoji_catalog (emoji_id, name, added_by) VALUES (?, ?, ?)',
-                    (item['emoji_id'], item['name'], 0)
-                )
-            
-            for appr in data.get('approvers', []):
-                self.cursor.execute(
-                    'INSERT INTO approvers (user_id, username, added_by) VALUES (?, ?, ?)',
-                    (appr['user_id'], appr['username'], 0)
-                )
-            
-            self.conn.commit()
-            return True
-        except Exception:
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+#  База данных (SQLite in-memory)
+# ─────────────────────────────────────────────
+con = sqlite3.connect(":memory:", check_same_thread=False)
+con.row_factory = sqlite3.Row
+
+def db_init() -> None:
+    cur = con.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS emoji_catalog (
+            emoji_id   TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            added_by   TEXT,
+            added_at   TEXT
+        );
+        CREATE TABLE IF NOT EXISTS approvers (
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT,
+            added_by   TEXT,
+            added_at   TEXT
+        );
+    """)
+    # Начальный эмодзи
+    cur.execute(
+        "INSERT OR IGNORE INTO emoji_catalog VALUES (?,?,?,?)",
+        (DEFAULT_EMOJI_ID, DEFAULT_EMOJI_NAME, "system", datetime.utcnow().isoformat()),
+    )
+    con.commit()
+
+
+def db_get_catalog() -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM emoji_catalog ORDER BY added_at").fetchall()
+
+
+def db_add_emoji(emoji_id: str, name: str, added_by: str) -> None:
+    con.execute(
+        "INSERT OR REPLACE INTO emoji_catalog VALUES (?,?,?,?)",
+        (emoji_id, name, added_by, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+
+
+def db_get_approvers() -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM approvers ORDER BY added_at").fetchall()
+
+
+def db_add_approver(user_id: int, username: str, added_by: str) -> None:
+    con.execute(
+        "INSERT OR REPLACE INTO approvers VALUES (?,?,?,?)",
+        (user_id, username, added_by, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+
+
+def db_remove_approver(user_id: int) -> bool:
+    cur = con.execute("DELETE FROM approvers WHERE user_id=?", (user_id,))
+    con.commit()
+    return cur.rowcount > 0
+
+
+def db_is_approver(user_id: int) -> bool:
+    row = con.execute("SELECT 1 FROM approvers WHERE user_id=?", (user_id,)).fetchone()
+    return row is not None
+
+
+def db_export() -> str:
+    data = {
+        "emoji_catalog": [dict(r) for r in db_get_catalog()],
+        "approvers":     [dict(r) for r in db_get_approvers()],
+    }
+    return "EMOJI_BACKUP:" + base64.b64encode(json.dumps(data).encode()).decode()
+
+
+def db_import(raw: str) -> bool:
+    try:
+        if not raw.startswith("EMOJI_BACKUP:"):
             return False
+        data = json.loads(base64.b64decode(raw[13:]).decode())
+        cur = con.cursor()
+        for row in data.get("emoji_catalog", []):
+            cur.execute(
+                "INSERT OR REPLACE INTO emoji_catalog VALUES (?,?,?,?)",
+                (row["emoji_id"], row["name"], row["added_by"], row["added_at"]),
+            )
+        for row in data.get("approvers", []):
+            cur.execute(
+                "INSERT OR REPLACE INTO approvers VALUES (?,?,?,?)",
+                (row["user_id"], row["username"], row["added_by"], row["added_at"]),
+            )
+        con.commit()
+        return True
+    except Exception as e:
+        log.error("import error: %s", e)
+        return False
 
-db = Database()
 
-# ============ СЕССИИ ============
-@dataclass
+# ─────────────────────────────────────────────
+#  Сессии пользователей
+# ─────────────────────────────────────────────
 class Part:
-    text: str
-    emoji_id: str  # ID премиум эмодзи для этой части
+    __slots__ = ("text", "emoji_id")
 
-@dataclass
+    def __init__(self, text: str, emoji_id: str = DEFAULT_EMOJI_ID):
+        self.text = text
+        self.emoji_id = emoji_id          # или NO_EMOJI
+
+
 class Session:
-    parts: List[Part]
-    waiting_for_input: bool = False
-    current_part_index: int = 0  # Для какой части выбираем эмодзи
-    selecting_emoji: bool = False
-    emoji_page: int = 0
-    waiting_for_emoji_name: bool = False
-    pending_emoji_id: Optional[str] = None
+    def __init__(self):
+        self.parts: list[Part] = []
+        self.waiting_for_input: bool = False
+        self.current_part_index: int = 0
+        self.selecting_emoji: bool = False
+        self.emoji_page: int = 0
+        self.waiting_for_emoji_name: bool = False
+        self.pending_emoji_id: Optional[str] = None
+        self.last_message_id: Optional[int] = None
+        # сообщение-пагинатор (может отличаться от last_message_id)
+        self.picker_message_id: Optional[int] = None
 
-sessions: Dict[int, Session] = {}
+
+sessions: dict[int, Session] = {}
+
 
 def get_session(user_id: int) -> Session:
     if user_id not in sessions:
-        sessions[user_id] = Session(parts=[])
+        sessions[user_id] = Session()
     return sessions[user_id]
 
-def clear_session(user_id: int):
-    if user_id in sessions:
-        del sessions[user_id]
 
-# ============ БОТ ============
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+# ─────────────────────────────────────────────
+#  Глобальные состояния admin
+# ─────────────────────────────────────────────
+admin_waiting_add:    set[int] = set()   # ждём username нового аппрувера
+admin_waiting_remove: set[int] = set()   # ждём user_id для удаления
+admin_waiting_down:   set[int] = set()   # ждём строку бэкапа
 
+
+# ─────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────
 def is_admin(username: Optional[str]) -> bool:
-    return username is not None and username.lower() in ADMIN_USERNAMES
+    return bool(username and username.lstrip("@") in ADMINS)
 
-def format_emoji_html(emoji_id: str) -> str:
-    return f'<tg-emoji emoji-id="{emoji_id}">👍</tg-emoji>'
+
+def tg_emoji_tag(emoji_id: str, placeholder: str = "⭐") -> str:
+    return f'<tg-emoji emoji-id="{emoji_id}">{placeholder}</tg-emoji>'
+
 
 def build_final_text(session: Session) -> str:
-    if not session.parts:
-        return '...'
-    result = []
+    """Собираем итоговый текст из частей."""
+    chunks: list[str] = []
     for part in session.parts:
-        result.append(part.text)
-        result.append(format_emoji_html(part.emoji_id))
-    return ' '.join(result)
+        chunks.append(part.text)
+        if part.emoji_id != NO_EMOJI:
+            chunks.append(tg_emoji_tag(part.emoji_id))
+    return " ".join(chunks) if chunks else "..."
 
-def build_main_keyboard(session: Session) -> InlineKeyboardMarkup:
-    buttons = []
-    
-    # Кнопки для каждой части (вкл/выкл эмодзи + сменить эмодзи)
+
+# ─────────────────────────────────────────────
+#  Клавиатуры
+# ─────────────────────────────────────────────
+def build_editor_keyboard(session: Session) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
     for i, part in enumerate(session.parts):
-        label = 'Основной' if i == 0 else f'Добавка {i}'
-        # Кнопка вкл/выкл (всегда вкл в новой версии, но оставим для совместимости)
-        buttons.append([InlineKeyboardButton(
-            text=f'🎭 Сменить эмодзи {label}',
-            callback_data=f'change_emoji_{i}'
-        )])
-    
-    # Кнопка добавить
-    if len(session.parts) <= MAX_ADDITIONS and not session.waiting_for_input:
-        buttons.append([InlineKeyboardButton(
-            text=f'➕ Добавить ({len(session.parts) - 1}/{MAX_ADDITIONS})',
-            callback_data='add_part'
-        )])
-    
-    # Отмена если ждём ввод
+        label = "Основной" if i == 0 else f"Добавка {i}"
+        has_emoji = part.emoji_id != NO_EMOJI
+        emoji_icon = "✅" if has_emoji else "❌"
+
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{emoji_icon} {label}",
+                callback_data=f"toggle_{i}",
+            ),
+            InlineKeyboardButton(
+                text="🎭 Сменить",
+                callback_data=f"pick_emoji_{i}",
+            ),
+        ])
+
+    extras = len(session.parts) - 1          # сколько добавок уже есть
+    if extras < MAX_ADDITIONS and not session.waiting_for_input:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"➕ Добавить ({extras}/{MAX_ADDITIONS})",
+                callback_data="add",
+            )
+        ])
+
     if session.waiting_for_input:
-        buttons.append([InlineKeyboardButton(
-            text='❌ Отмена',
-            callback_data='cancel_input'
-        )])
-    
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        rows.append([
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")
+        ])
 
-def build_emoji_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
-    catalog = db.get_catalog()
-    start = page * EMOJI_PER_PAGE
-    end = start + EMOJI_PER_PAGE
-    page_items = catalog[start:end]
-    
-    buttons = []
-    
-    # Кнопки выбора (5 рядов по 2)
-    row = []
-    for i, item in enumerate(page_items):
-        row.append(InlineKeyboardButton(
-            text=f'Выбрать {i+1}',
-            callback_data=f'select_emoji_{start + i}'
-        ))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_picker_keyboard(page: int) -> InlineKeyboardMarkup:
+    """Клавиатура выбора эмодзи."""
+    catalog = db_get_catalog()
+    total = len(catalog)
+    per_page = 10
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * per_page
+    items = catalog[start: start + per_page]
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Кнопка «Без эмодзи»
+    rows.append([InlineKeyboardButton(text="❌ Без эмодзи", callback_data="ep_none")])
+
+    # Кнопки выбора по 2 в ряд
+    pair: list[InlineKeyboardButton] = []
+    for local_idx, row in enumerate(items):
+        num = local_idx + 1
+        btn = InlineKeyboardButton(
+            text=f"Выбрать {num}",
+            callback_data=f"ep_sel_{start + local_idx}",
+        )
+        pair.append(btn)
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
     # Навигация
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text='←', callback_data=f'emoji_page_{page-1}'))
+    nav: list[InlineKeyboardButton] = []
+    nav.append(
+        InlineKeyboardButton(
+            text="←" if page > 0 else "·",
+            callback_data=f"ep_page_{page - 1}" if page > 0 else "ep_noop",
+        )
+    )
+    nav.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data="ep_noop",
+        )
+    )
+    nav.append(
+        InlineKeyboardButton(
+            text="→" if page < total_pages - 1 else "·",
+            callback_data=f"ep_page_{page + 1}" if page < total_pages - 1 else "ep_noop",
+        )
+    )
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="ep_close")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_picker_text(page: int) -> str:
+    """Текст сообщения выбора эмодзи."""
+    catalog = db_get_catalog()
+    per_page = 10
+    total_pages = max(1, (len(catalog) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * per_page
+    items = catalog[start: start + per_page]
+
+    lines = ["🎭 <b>Выберите эмодзи:</b>\n"]
+    for local_idx, row in enumerate(items):
+        num = local_idx + 1
+        preview = tg_emoji_tag(row["emoji_id"])
+        lines.append(f"{num}. {preview} {row['name']}")
+
+    return "\n".join(lines)
+
+
+def build_upuser_text() -> str:
+    approvers = db_get_approvers()
+    lines = ["👑 <b>Панель администратора</b>\n", "<b>Аппруверы:</b>"]
+    if approvers:
+        for a in approvers:
+            uname = f"@{a['username']}" if a["username"] else "—"
+            lines.append(f"• {uname} (ID: <code>{a['user_id']}</code>)")
     else:
-        nav_buttons.append(InlineKeyboardButton(text='•', callback_data='noop'))
-    
-    nav_buttons.append(InlineKeyboardButton(text=f'{page+1}/{total_pages}', callback_data='noop'))
-    
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton(text='→', callback_data=f'emoji_page_{page+1}'))
-    else:
-        nav_buttons.append(InlineKeyboardButton(text='•', callback_data='noop'))
-    
-    buttons.append(nav_buttons)
-    buttons.append([InlineKeyboardButton(text='❌ Закрыть', callback_data='close_emoji_selector')])
-    
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        lines.append("• Список пуст")
+    return "\n".join(lines)
 
-def build_emoji_preview_text(page: int) -> str:
-    catalog = db.get_catalog()
-    start = page * EMOJI_PER_PAGE
-    end = start + EMOJI_PER_PAGE
-    page_items = catalog[start:end]
-    
-    lines = ['<b>Выберите эмодзи:</b>\n']
-    for i, item in enumerate(page_items, 1):
-        emoji_html = format_emoji_html(item['emoji_id'])
-        lines.append(f'{i}. {emoji_html} {item["name"]}')
-    
-    return '\n'.join(lines)
 
-# ============ ХЕНДЛЕРЫ ============
+def build_upuser_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить аппрувера", callback_data="adm_add")],
+        [InlineKeyboardButton(text="➖ Удалить аппрувера",  callback_data="adm_remove")],
+    ])
 
-@dp.message(Command('start'))
-async def cmd_start(message: Message):
+
+# ─────────────────────────────────────────────
+#  Bot + Dispatcher
+# ─────────────────────────────────────────────
+bot = Bot(token=TOKEN)
+dp  = Dispatcher()
+
+
+# ─────────────────────────────────────────────
+#  /start
+# ─────────────────────────────────────────────
+@dp.message(Command("start"))
+async def cmd_start(message: Message) -> None:
     await message.answer(
-        '👋 Отправьте текст, чтобы создать сообщение с премиум-эмодзи.\n\n'
-        'Используйте кнопки для добавления частей и смены эмодзи.'
+        "👋 Привет! Отправь любой текст — и я склею его с премиум-эмодзи.\n"
+        "Можно добавлять до 5 дополнительных частей.",
+        parse_mode="HTML",
     )
 
-@dp.message(Command('upuser'))
-async def cmd_upuser(message: Message):
+
+# ─────────────────────────────────────────────
+#  /upuser  (только для админов)
+# ─────────────────────────────────────────────
+@dp.message(Command("upuser"))
+async def cmd_upuser(message: Message) -> None:
     if not is_admin(message.from_user.username):
+        await message.answer("⛔ Нет доступа.")
         return
-    
-    approvers = db.get_approvers()
-    text = '<b>👑 Панель администратора</b>\n\n<b>Аппруверы:</b>\n'
-    
-    if not approvers:
-        text += 'Нет аппруверов\n'
-    else:
-        for appr in approvers:
-            text += f'• @{appr["username"]} (ID: {appr["user_id"]})\n'
-    
-    buttons = [
-        [InlineKeyboardButton(text='➕ Добавить аппрувера', callback_data='admin_add_approver')],
-        [InlineKeyboardButton(text='➖ Удалить аппрувера', callback_data='admin_remove_approver')]
-    ]
-    
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer(
+        build_upuser_text(),
+        reply_markup=build_upuser_keyboard(),
+        parse_mode="HTML",
+    )
 
-@dp.message(Command('up'))
-async def cmd_up(message: Message):
+
+# ─────────────────────────────────────────────
+#  /up  — экспорт
+# ─────────────────────────────────────────────
+@dp.message(Command("up"))
+async def cmd_up(message: Message) -> None:
     if not is_admin(message.from_user.username):
+        await message.answer("⛔ Нет доступа.")
         return
-    backup = db.export_data()
-    await message.answer(f'<code>{backup}</code>\n\nСкопируйте эту строку для резервного копирования.')
+    backup = db_export()
+    await message.answer(
+        f"📦 <b>Бэкап:</b>\n<code>{backup}</code>",
+        parse_mode="HTML",
+    )
 
-@dp.message(Command('down'))
-async def cmd_down(message: Message):
+
+# ─────────────────────────────────────────────
+#  /down  — начало импорта
+# ─────────────────────────────────────────────
+@dp.message(Command("down"))
+async def cmd_down(message: Message) -> None:
     if not is_admin(message.from_user.username):
+        await message.answer("⛔ Нет доступа.")
         return
-    await message.answer('Отправьте строку бэкапа для восстановления.')
+    admin_waiting_down.add(message.from_user.id)
+    await message.answer("📥 Отправь строку бэкапа (начинается с <code>EMOJI_BACKUP:</code>):", parse_mode="HTML")
 
-@dp.message(F.text.startswith('EMOJI_BACKUP:'))
-async def handle_backup_import(message: Message):
-    if not is_admin(message.from_user.username):
-        return
-    if db.import_data(message.text):
-        await message.answer('✅ Каталог и аппруверы восстановлены!')
-    else:
-        await message.answer('❌ Ошибка импорта. Проверьте строку.')
 
-# ============ ОСНОВНАЯ ЛОГИКА ============
+# ─────────────────────────────────────────────
+#  /cancel  — глобальный
+# ─────────────────────────────────────────────
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message) -> None:
+    uid = message.from_user.id
+    admin_waiting_add.discard(uid)
+    admin_waiting_remove.discard(uid)
+    admin_waiting_down.discard(uid)
 
-@dp.message(F.text & ~F.text.startswith('/'))
-async def handle_text(message: Message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    text = message.text
-    
-    session = get_session(user_id)
-    
-    # Если ждём название для нового эмодзи (аппрувер)
-    if session.waiting_for_emoji_name and session.pending_emoji_id:
-        db.add_emoji(session.pending_emoji_id, text, user_id)
+    session = get_session(uid)
+    if session.waiting_for_input:
+        session.waiting_for_input = False
+        if session.parts:
+            await _refresh_editor(message.chat.id, session)
+    if session.waiting_for_emoji_name:
         session.waiting_for_emoji_name = False
         session.pending_emoji_id = None
-        await message.answer(f'✅ Эмодзи добавлен в каталог как "{text}"')
-        return
-    
-    # Если ждём ввод для добавки
-    if session.waiting_for_input:
-        session.parts.append(Part(text=text, emoji_id=DEFAULT_EMOJI_ID))
-        session.waiting_for_input = False
-        
-        result = await message.answer(
-            build_final_text(session),
-            reply_markup=build_main_keyboard(session),
-            parse_mode=ParseMode.HTML
-        )
-        session.last_message_id = result.message_id
-        return
-    
-    # Новое сообщение - сбрасываем всё
-    session.parts = [Part(text=text, emoji_id=DEFAULT_EMOJI_ID)]
-    session.waiting_for_input = False
-    session.selecting_emoji = False
-    
-    result = await message.answer(
-        build_final_text(session),
-        reply_markup=build_main_keyboard(session),
-        parse_mode=ParseMode.HTML
-    )
-    session.last_message_id = result.message_id
 
-@dp.message(F.entities)
-async def handle_entities(message: Message):
-    """Обработка премиум-эмодзи"""
-    user_id = message.from_user.id
-    username = message.from_user.username
-    
-    # Ищем кастомные эмодзи в сообщении
-    custom_emojis = []
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == 'custom_emoji':
-                custom_emojis.append(entity.custom_emoji_id)
-    
-    if not custom_emojis:
+    await message.answer("❌ Отменено.")
+
+
+# ─────────────────────────────────────────────
+#  Обработчик текстовых сообщений
+# ─────────────────────────────────────────────
+@dp.message(F.text)
+async def on_text(message: Message) -> None:
+    uid      = message.from_user.id
+    text     = message.text.strip()
+    username = message.from_user.username or ""
+    session  = get_session(uid)
+
+    # ── 1. Ожидание строки бэкапа (/down)
+    if uid in admin_waiting_down:
+        admin_waiting_down.discard(uid)
+        if db_import(text):
+            await message.answer("✅ Бэкап восстановлен!")
+        else:
+            await message.answer("❌ Ошибка формата. Начало должно быть <code>EMOJI_BACKUP:</code>", parse_mode="HTML")
         return
-    
-    emoji_id = custom_emojis[0]  # Берём первый
-    
-    # Если аппрувер - предлагаем добавить в каталог
-    if db.is_approver(user_id) or is_admin(username):
-        session = get_session(user_id)
-        session.pending_emoji_id = emoji_id
-        session.waiting_for_emoji_name = True
-        
+
+    # ── 2. Ожидание username нового аппрувера
+    if uid in admin_waiting_add:
+        admin_waiting_add.discard(uid)
+        target_username = text.lstrip("@")
         await message.answer(
-            f'🎭 <b>Премиум-эмодзи</b>\n'
-            f'ID: <code>{emoji_id}</code>\n\n'
-            f'Вы можете добавить его в каталог. Отправьте название для этого эмодзи (или /cancel для отмены):'
+            f"⚠️ Я не могу сам получить ID пользователя по username.\n"
+            f"Попроси <b>@{target_username}</b> написать боту — и добавь его командой из панели, "
+            f"указав числовой ID.",
+            parse_mode="HTML",
         )
-    else:
-        # Обычный пользователь - просто показываем ID
-        await message.answer(f'🎭 ID премиум-эмодзи: <code>{emoji_id}</code>')
-
-@dp.callback_query(F.data == 'noop')
-async def noop(callback: CallbackQuery):
-    await callback.answer()
-
-@dp.callback_query(F.data == 'add_part')
-async def add_part(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = get_session(user_id)
-    
-    if len(session.parts) > MAX_ADDITIONS:
-        await callback.answer('Лимит добавок!')
+        # Показываем панель снова
+        await message.answer(build_upuser_text(), reply_markup=build_upuser_keyboard(), parse_mode="HTML")
         return
-    
-    session.waiting_for_input = True
-    
-    await callback.message.edit_text(
-        build_final_text(session) + '\n\n✏️ Введите текст для добавки:',
-        reply_markup=build_main_keyboard(session),
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer('Введите текст')
 
-@dp.callback_query(F.data == 'cancel_input')
-async def cancel_input(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = get_session(user_id)
-    
+    # ── 3. Ожидание ID для удаления аппрувера
+    if uid in admin_waiting_remove:
+        admin_waiting_remove.discard(uid)
+        try:
+            target_id = int(text)
+        except ValueError:
+            await message.answer("❌ Нужен числовой ID.")
+            return
+        if db_remove_approver(target_id):
+            await message.answer(f"✅ Аппрувер <code>{target_id}</code> удалён.", parse_mode="HTML")
+        else:
+            await message.answer(f"❌ Аппрувер с ID <code>{target_id}</code> не найден.", parse_mode="HTML")
+        await message.answer(build_upuser_text(), reply_markup=build_upuser_keyboard(), parse_mode="HTML")
+        return
+
+    # ── 4. Ожидание названия эмодзи (аппрувер добавляет в каталог)
+    if session.waiting_for_emoji_name and session.pending_emoji_id:
+        session.waiting_for_emoji_name = False
+        emoji_id = session.pending_emoji_id
+        session.pending_emoji_id = None
+        db_add_emoji(emoji_id, text, username)
+        await message.answer(
+            f"✅ Эмодзи {tg_emoji_tag(emoji_id)} <b>{text}</b> добавлен в каталог!",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── 5. Ожидание текста добавки в редакторе
+    if session.waiting_for_input:
+        session.parts.append(Part(text=text))
+        session.waiting_for_input = False
+        await _refresh_editor(message.chat.id, session)
+        return
+
+    # ── 6. Новое сообщение → новый редактор
+    session.parts = [Part(text=text)]
     session.waiting_for_input = False
-    
-    await callback.message.edit_text(
+    session.selecting_emoji    = False
+    session.last_message_id    = None
+    session.picker_message_id  = None
+
+    sent = await message.answer(
         build_final_text(session),
-        reply_markup=build_main_keyboard(session),
-        parse_mode=ParseMode.HTML
+        reply_markup=build_editor_keyboard(session),
+        parse_mode="HTML",
     )
-    await callback.answer('Отменено')
+    session.last_message_id = sent.message_id
 
-@dp.callback_query(F.data.startswith('change_emoji_'))
-async def change_emoji(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = get_session(user_id)
-    
-    part_idx = int(callback.data.split('_')[2])
-    session.current_part_index = part_idx
-    session.selecting_emoji = True
-    session.emoji_page = 0
-    
-    catalog = db.get_catalog()
-    total_pages = (len(catalog) + EMOJI_PER_PAGE - 1) // EMOJI_PER_PAGE
-    
-    await callback.message.edit_text(
-        build_emoji_preview_text(0),
-        reply_markup=build_emoji_keyboard(0, total_pages),
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
 
-@dp.callback_query(F.data.startswith('emoji_page_'))
-async def emoji_page(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = get_session(user_id)
-    
-    page = int(callback.data.split('_')[2])
-    session.emoji_page = page
-    
-    catalog = db.get_catalog()
-    total_pages = (len(catalog) + EMOJI_PER_PAGE - 1) // EMOJI_PER_PAGE
-    
-    await callback.message.edit_text(
-        build_emoji_preview_text(page),
-        reply_markup=build_emoji_keyboard(page, total_pages),
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
+# ─────────────────────────────────────────────
+#  Обработчик премиум-эмодзи (entities)
+# ─────────────────────────────────────────────
+@dp.message(F.content_type == "text")   # дублируем через entity-фильтр ниже
+async def _dummy(_: Message) -> None:
+    pass  # никогда не вызовется — нужен только как маркер
 
-@dp.callback_query(F.data.startswith('select_emoji_'))
-async def select_emoji(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = get_session(user_id)
-    
-    emoji_idx = int(callback.data.split('_')[2])
-    catalog = db.get_catalog()
-    
-    if emoji_idx >= len(catalog):
-        await callback.answer('Ошибка!')
+
+@dp.message()
+async def on_any_message(message: Message) -> None:
+    """Ловим сообщения с premium emoji (custom_emoji entity)."""
+    if not message.entities:
         return
-    
-    selected = catalog[emoji_idx]
-    part_idx = session.current_part_index
-    
-    if part_idx < len(session.parts):
-        session.parts[part_idx].emoji_id = selected['emoji_id']
-    
-    session.selecting_emoji = False
-    
-    await callback.message.edit_text(
-        build_final_text(session),
-        reply_markup=build_main_keyboard(session),
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer(f'Выбрано: {selected["name"]}')
 
-@dp.callback_query(F.data == 'close_emoji_selector')
-async def close_emoji_selector(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    session = get_session(user_id)
-    
-    session.selecting_emoji = False
-    
-    await callback.message.edit_text(
-        build_final_text(session),
-        reply_markup=build_main_keyboard(session),
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
+    uid = message.from_user.id
+    session = get_session(uid)
 
-# ============ АДМИН-ПАНЕЛЬ ============
-
-@dp.callback_query(F.data == 'admin_add_approver')
-async def admin_add_approver(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
+    custom_ids = [
+        e.custom_emoji_id
+        for e in message.entities
+        if e.type == "custom_emoji" and e.custom_emoji_id
+    ]
+    if not custom_ids:
         return
-    await callback.message.answer('Отправьте username пользователя (без @) для добавления как аппрувера:')
-    await callback.answer()
 
-@dp.callback_query(F.data == 'admin_remove_approver')
-async def admin_remove_approver(callback: CallbackQuery):
-    if not is_admin(callback.from_user.username):
+    emoji_id = custom_ids[0]
+
+    # Аппрувер — предлагаем добавить в каталог
+    if db_is_approver(uid):
+        if session.waiting_for_emoji_name:
+            await message.answer("⏳ Сначала введи название для предыдущего эмодзи.")
+            return
+        session.pending_emoji_id   = emoji_id
+        session.waiting_for_emoji_name = True
+        await message.answer(
+            f"🎭 Эмодзи получен: {tg_emoji_tag(emoji_id)}\n"
+            f"ID: <code>{emoji_id}</code>\n\n"
+            f"Введи название для каталога:",
+            parse_mode="HTML",
+        )
         return
-    await callback.message.answer('Отправьте ID пользователя для удаления:')
-    await callback.answer()
 
-async def main():
-    await dp.start_polling(bot)
+    # Обычный пользователь — просто показываем ID
+    await message.answer(
+        f"ID: <code>{emoji_id}</code>",
+        parse_mode="HTML",
+    )
 
-if __name__ == '__main__':
+
+# ─────────────────────────────────────────────
+#  Callbacks
+# ─────────────────────────────────────────────
+@dp.callback_query()
+async def on_callback(query: CallbackQuery) -> None:
+    uid     = query.from_user.id
+    data    = query.data
+    chat_id = query.message.chat.id
+    session = get_session(uid)
+    username = query.from_user.username or str(uid)
+
+    # ── Админ-панель ──────────────────────────────────────────────────────────
+    if data == "adm_add":
+        if not is_admin(query.from_user.username):
+            await query.answer("⛔ Нет доступа.")
+            return
+        admin_waiting_add.add(uid)
+        await query.answer()
+        await query.message.answer(
+            "👤 Введи <b>username</b> нового аппрувера (с @ или без):",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "adm_remove":
+        if not is_admin(query.from_user.username):
+            await query.answer("⛔ Нет доступа.")
+            return
+        admin_waiting_remove.add(uid)
+        await query.answer()
+        await query.message.answer(
+            "🗑 Введи числовой <b>user_id</b> аппрувера для удаления:",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── Эмодзи-пикер: навигация ──────────────────────────────────────────────
+    if data.startswith("ep_page_"):
+        new_page = int(data.split("_")[-1])
+        session.emoji_page = new_page
+        await query.answer()
+        await query.message.edit_text(
+            build_picker_text(new_page),
+            reply_markup=build_picker_keyboard(new_page),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "ep_noop":
+        await query.answer()
+        return
+
+    if data == "ep_none":
+        # Убрать эмодзи для текущей части
+        idx = session.current_part_index
+        if 0 <= idx < len(session.parts):
+            session.parts[idx].emoji_id = NO_EMOJI
+        session.selecting_emoji = False
+        await query.answer("❌ Эмодзи убран")
+        # Закрываем пикер и обновляем редактор
+        await query.message.delete()
+        session.picker_message_id = None
+        await _refresh_editor(chat_id, session)
+        return
+
+    if data.startswith("ep_sel_"):
+        catalog = db_get_catalog()
+        cat_idx = int(data.split("_")[-1])
+        if 0 <= cat_idx < len(catalog):
+            emoji_id = catalog[cat_idx]["emoji_id"]
+            name     = catalog[cat_idx]["name"]
+            idx = session.current_part_index
+            if 0 <= idx < len(session.parts):
+                session.parts[idx].emoji_id = emoji_id
+            session.selecting_emoji = False
+            await query.answer(f"✅ Выбран: {name}")
+        else:
+            await query.answer("❌ Не найдено")
+        await query.message.delete()
+        session.picker_message_id = None
+        await _refresh_editor(chat_id, session)
+        return
+
+    if data == "ep_close":
+        session.selecting_emoji = False
+        await query.answer("Закрыто")
+        await query.message.delete()
+        session.picker_message_id = None
+        await _refresh_editor(chat_id, session)
+        return
+
+    # ── Редактор ─────────────────────────────────────────────────────────────
+    if data == "add":
+        extras = len(session.parts) - 1
+        if extras >= MAX_ADDITIONS:
+            await query.answer("⚠️ Лимит 5 добавок!")
+            return
+        session.waiting_for_input = True
+        await query.answer("✏️ Введи текст (или /cancel)")
+        await _refresh_editor(chat_id, session)
+        return
+
+    if data == "cancel":
+        session.waiting_for_input = False
+        await query.answer("❌ Отменено")
+        await _refresh_editor(chat_id, session)
+        return
+
+    if data.startswith("toggle_"):
+        idx = int(data.split("_")[1])
+        if 0 <= idx < len(session.parts):
+            if session.parts[idx].emoji_id == NO_EMOJI:
+                session.parts[idx].emoji_id = DEFAULT_EMOJI_ID
+                await query.answer("✅ Эмодзи включён")
+            else:
+                session.parts[idx].emoji_id = NO_EMOJI
+                await query.answer("❌ Эмодзи выключен")
+        await _refresh_editor(chat_id, session)
+        return
+
+    if data.startswith("pick_emoji_"):
+        idx = int(data.split("_")[-1])
+        session.current_part_index = idx
+        session.selecting_emoji    = True
+        session.emoji_page         = 0
+        await query.answer()
+        sent = await bot.send_message(
+            chat_id,
+            build_picker_text(0),
+            reply_markup=build_picker_keyboard(0),
+            parse_mode="HTML",
+        )
+        session.picker_message_id = sent.message_id
+        return
+
+    await query.answer()
+
+
+# ─────────────────────────────────────────────
+#  Вспомогательная функция обновления редактора
+# ─────────────────────────────────────────────
+async def _refresh_editor(chat_id: int, session: Session) -> None:
+    """Редактирует существующее сообщение редактора или создаёт новое."""
+    text    = build_final_text(session)
+    markup  = build_editor_keyboard(session)
+
+    if session.waiting_for_input:
+        text += "\n\n✏️ <i>Введи текст для добавки:</i>"
+
+    if session.last_message_id:
+        try:
+            await bot.edit_message_text(
+                text=text,
+                chat_id=chat_id,
+                message_id=session.last_message_id,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            return
+        except Exception:
+            pass  # сообщение удалено — создадим новое
+
+    sent = await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    session.last_message_id = sent.message_id
+
+
+# ─────────────────────────────────────────────
+#  Точка входа
+# ─────────────────────────────────────────────
+async def main() -> None:
+    db_init()
+    log.info("Bot started")
+    await dp.start_polling(bot, skip_updates=True)
+
+
+if __name__ == "__main__":
     asyncio.run(main())
