@@ -50,10 +50,20 @@ def db_init() -> None:
             added_at   TEXT
         );
     """)
-    cur.execute(
-        "INSERT OR IGNORE INTO emoji_catalog VALUES (?,?,?,?)",
-        (DEFAULT_EMOJI_ID, DEFAULT_EMOJI_NAME, "system", datetime.utcnow().isoformat()),
-    )
+
+    default_emojis = [
+        ("5285430309720966085", "Стандартный #1"),
+        ("5310169226856644648", "Стандартный #2"),
+        ("5310076249404621168", "Стандартный #3"),
+        ("5285032475490273112", "Стандартный #4"),
+    ]
+
+    for emoji_id, name in default_emojis:
+        cur.execute(
+            "INSERT OR IGNORE INTO emoji_catalog VALUES (?,?,?,?)",
+            (emoji_id, name, "system", datetime.utcnow().isoformat()),
+        )
+
     con.commit()
 
 def db_get_catalog() -> list:
@@ -446,7 +456,6 @@ async def on_text(message: Message) -> None:
                 "<code>123456789</code>",
                 parse_mode="HTML",
             )
-            # Оставляем в режиме ожидания
             return
         target_username = parts_input[1].lstrip("@") if len(parts_input) > 1 else ""
         admin_waiting_add.discard(uid)
@@ -475,7 +484,6 @@ async def on_text(message: Message) -> None:
                 "Пример: <code>123456789</code>",
                 parse_mode="HTML",
             )
-            # Оставляем в режиме ожидания
             return
         admin_waiting_remove.discard(uid)
         if db_remove_approver(target_id):
