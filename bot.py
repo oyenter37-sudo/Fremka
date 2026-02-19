@@ -142,8 +142,13 @@ class Session:
         self.emoji_page: int = 0
         self.waiting_for_emoji_name: bool = False
         self.pending_emoji_id: Optional[str] = None
+        # Очередь эмодзи для аппрувера (когда в сообщении несколько)
+        self.pending_emoji_queue: list[str] = []
         self.last_message_id: Optional[int] = None
         self.picker_message_id: Optional[int] = None
+        # Прикреплённое фото
+        self.photo_file_id: Optional[str] = None
+        self.waiting_for_photo: bool = False
 
 sessions: dict[int, Session] = {}
 
@@ -179,6 +184,18 @@ def build_final_text(session: Session) -> str:
             chunks.append(tg_emoji_tag(part.emoji_id))
     return " ".join(chunks) if chunks else "..."
 
+def extract_custom_emoji_ids(message: Message) -> list[str]:
+    """Извлекаем все уникальные custom_emoji_id из сообщения (текст или подпись)."""
+    entities = message.entities or message.caption_entities or []
+    seen = set()
+    result = []
+    for e in entities:
+        if e.type == "custom_emoji" and e.custom_emoji_id:
+            if e.custom_emoji_id not in seen:
+                seen.add(e.custom_emoji_id)
+                result.append(e.custom_emoji_id)
+    return result
+
 # ─────────────────────────────────────────────
 #  Клавиатуры
 # ─────────────────────────────────────────────
@@ -198,6 +215,17 @@ def build_editor_keyboard(session: Session) -> InlineKeyboardMarkup:
                 callback_data=f"pick_emoji_{i}",
             ),
         ])
+
+    # Кнопка фото
+    if session.photo_file_id:
+        rows.append([
+            InlineKeyboardButton(text="🖼️ Фото прикреплено ✅", callback_data="photo_remove"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="🖼️ Прикрепить фото", callback_data="photo_attach"),
+        ])
+
     extras = len(session.parts) - 1
     if extras < MAX_ADDITIONS and not session.waiting_for_input:
         rows.append([
@@ -289,6 +317,19 @@ def build_upuser_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➖ Удалить аппрувера",  callback_data="adm_remove")],
     ])
 
+def build_approver_emoji_keyboard(emoji_ids: list[str]) -> InlineKeyboardMarkup:
+    """Клавиатура для аппрувера — список найденных эмодзи с кнопками добавления."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, emoji_id in enumerate(emoji_ids):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"➕ Добавить #{i + 1} в каталог",
+                callback_data=f"aq_add_{i}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="aq_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 # ─────────────────────────────────────────────
 #  Bot + Dispatcher
 # ─────────────────────────────────────────────
@@ -296,13 +337,36 @@ bot = Bot(token=TOKEN)
 dp  = Dispatcher()
 
 # ─────────────────────────────────────────────
-#  Вспомогательная: обновление редактора
+#  Вспомогательные функции
 # ─────────────────────────────────────────────
 async def _refresh_editor(chat_id: int, session: Session) -> None:
+    """Обновляем сообщение редактора."""
     text   = build_final_text(session)
     markup = build_editor_keyboard(session)
+
     if session.waiting_for_input:
         text += "\n\n✏️ <i>Введи текст для добавки:</i>"
+    if session.waiting_for_photo:
+        text += "\n\n🖼️ <i>Отправь фото для прикрепления:</i>"
+
+    # Если есть фото — удаляем старое сообщение и шлём новое с фото
+    if session.photo_file_id:
+        if session.last_message_id:
+            try:
+                await bot.delete_message(chat_id, session.last_message_id)
+            except Exception:
+                pass
+        sent = await bot.send_photo(
+            chat_id,
+            photo=session.photo_file_id,
+            caption=text,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        session.last_message_id = sent.message_id
+        return
+
+    # Без фото — обычное текстовое сообщение
     if session.last_message_id:
         try:
             await bot.edit_message_text(
@@ -315,8 +379,42 @@ async def _refresh_editor(chat_id: int, session: Session) -> None:
             return
         except Exception:
             pass
+
     sent = await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
     session.last_message_id = sent.message_id
+
+
+async def _handle_emoji_scan(message: Message, emoji_ids: list[str]) -> None:
+    """Обработка найденных эмодзи — для аппрувера и обычного пользователя."""
+    uid = message.from_user.id
+    session = get_session(uid)
+    username = message.from_user.username or str(uid)
+
+    if not emoji_ids:
+        return
+
+    if db_is_approver(uid):
+        # Сохраняем очередь в сессию
+        session.pending_emoji_queue = emoji_ids
+        session.pending_emoji_id = None
+        session.waiting_for_emoji_name = False
+
+        lines = [f"🔍 <b>Найдено эмодзи: {len(emoji_ids)}</b>\n"]
+        for i, eid in enumerate(emoji_ids):
+            lines.append(f"{i + 1}. {tg_emoji_tag(eid)} <code>{eid}</code>")
+
+        await message.answer(
+            "\n".join(lines),
+            reply_markup=build_approver_emoji_keyboard(emoji_ids),
+            parse_mode="HTML",
+        )
+    else:
+        # Обычный пользователь — просто показываем все ID
+        lines = [f"🔍 <b>Найдено эмодзи: {len(emoji_ids)}</b>\n"]
+        for i, eid in enumerate(emoji_ids):
+            lines.append(f"{i + 1}. ID: <code>{eid}</code>")
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
 
 # ─────────────────────────────────────────────
 #  Команды
@@ -325,7 +423,9 @@ async def _refresh_editor(chat_id: int, session: Session) -> None:
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 Привет! Отправь любой текст — и я склею его с премиум-эмодзи.\n"
-        "Можно добавлять до 5 дополнительных частей.",
+        "Можно добавлять до 5 дополнительных частей.\n\n"
+        "Также можешь переслать любое сообщение или отправить фото — "
+        "я найду все премиум-эмодзи внутри!",
         parse_mode="HTML",
     )
 
@@ -372,17 +472,67 @@ async def cmd_cancel(message: Message) -> None:
     admin_waiting_remove.discard(uid)
     admin_waiting_down.discard(uid)
     session = get_session(uid)
-    if session.waiting_for_input:
-        session.waiting_for_input = False
-        if session.parts:
-            await _refresh_editor(message.chat.id, session)
-    if session.waiting_for_emoji_name:
-        session.waiting_for_emoji_name = False
-        session.pending_emoji_id = None
+    session.waiting_for_input = False
+    session.waiting_for_photo = False
+    session.waiting_for_emoji_name = False
+    session.pending_emoji_id = None
+    session.pending_emoji_queue = []
+    if session.parts:
+        await _refresh_editor(message.chat.id, session)
     await message.answer("❌ Отменено.")
 
 # ─────────────────────────────────────────────
-#  Хендлер: сообщения с premium emoji
+#  Хендлер: фото
+# ─────────────────────────────────────────────
+@dp.message(F.photo)
+async def on_photo(message: Message) -> None:
+    uid = message.from_user.id
+    session = get_session(uid)
+
+    # Сначала проверяем эмодзи в подписи
+    emoji_ids = extract_custom_emoji_ids(message)
+
+    # Если ждём фото для редактора
+    if session.waiting_for_photo:
+        session.waiting_for_photo = False
+        session.photo_file_id = message.photo[-1].file_id
+        # Если в подписи есть эмодзи — тоже обрабатываем
+        if emoji_ids:
+            await _handle_emoji_scan(message, emoji_ids)
+        await _refresh_editor(message.chat.id, session)
+        return
+
+    # Просто фото (не в режиме ожидания) — сканируем эмодзи из подписи
+    if emoji_ids:
+        await _handle_emoji_scan(message, emoji_ids)
+        return
+
+    # Фото без эмодзи — предлагаем прикрепить к редактору если есть активный
+    if session.parts:
+        session.photo_file_id = message.photo[-1].file_id
+        await message.answer("🖼️ Фото прикреплено к текущему редактору!")
+        await _refresh_editor(message.chat.id, session)
+    else:
+        await message.answer(
+            "🖼️ Фото получено, но нет активного редактора.\n"
+            "Сначала отправь текст!",
+            parse_mode="HTML",
+        )
+
+# ─────────────────────────────────────────────
+#  Хендлер: любое пересланное сообщение
+#  (не фото, не текст — документы, видео, etc.)
+# ─────────────────────────────────────────────
+@dp.message(F.forward_origin)
+async def on_forward(message: Message) -> None:
+    emoji_ids = extract_custom_emoji_ids(message)
+    if emoji_ids:
+        await _handle_emoji_scan(message, emoji_ids)
+    else:
+        await message.answer("🔍 Премиум-эмодзи в этом сообщении не найдены.")
+
+# ─────────────────────────────────────────────
+#  Хендлер: текст с premium emoji
 # ─────────────────────────────────────────────
 def _has_custom_emoji(message: Message) -> bool:
     if not message.entities:
@@ -394,31 +544,15 @@ async def on_premium_emoji(message: Message) -> None:
     uid = message.from_user.id
     session = get_session(uid)
 
-    custom_ids = [
-        e.custom_emoji_id
-        for e in message.entities
-        if e.type == "custom_emoji" and e.custom_emoji_id
-    ]
-    if not custom_ids:
+    # Если ждём текст добавки — добавляем (эмодзи внутри текста — окей)
+    if session.waiting_for_input:
+        session.parts.append(Part(text=message.text.strip()))
+        session.waiting_for_input = False
+        await _refresh_editor(message.chat.id, session)
         return
 
-    emoji_id = custom_ids[0]
-
-    if db_is_approver(uid):
-        if session.waiting_for_emoji_name:
-            await message.answer("⏳ Сначала введи название для предыдущего эмодзи.")
-            return
-        session.pending_emoji_id = emoji_id
-        session.waiting_for_emoji_name = True
-        await message.answer(
-            f"🎭 Эмодзи получен: {tg_emoji_tag(emoji_id)}\n"
-            f"ID: <code>{emoji_id}</code>\n\n"
-            f"Введи название для каталога:",
-            parse_mode="HTML",
-        )
-        return
-
-    await message.answer(f"ID: <code>{emoji_id}</code>", parse_mode="HTML")
+    emoji_ids = extract_custom_emoji_ids(message)
+    await _handle_emoji_scan(message, emoji_ids)
 
 # ─────────────────────────────────────────────
 #  Хендлер: обычный текст
@@ -503,7 +637,7 @@ async def on_text(message: Message) -> None:
         )
         return
 
-    # 4. Ожидание названия эмодзи (аппрувер)
+    # 4. Ожидание названия эмодзи (аппрувер, одиночный режим)
     if session.waiting_for_emoji_name and session.pending_emoji_id:
         session.waiting_for_emoji_name = False
         emoji_id = session.pending_emoji_id
@@ -528,6 +662,8 @@ async def on_text(message: Message) -> None:
     session.selecting_emoji   = False
     session.last_message_id   = None
     session.picker_message_id = None
+    session.photo_file_id     = None
+    session.waiting_for_photo = False
 
     sent = await message.answer(
         build_final_text(session),
@@ -541,10 +677,11 @@ async def on_text(message: Message) -> None:
 # ─────────────────────────────────────────────
 @dp.callback_query()
 async def on_callback(query: CallbackQuery) -> None:
-    uid     = query.from_user.id
-    data    = query.data
-    chat_id = query.message.chat.id
-    session = get_session(uid)
+    uid      = query.from_user.id
+    data     = query.data
+    chat_id  = query.message.chat.id
+    session  = get_session(uid)
+    username = query.from_user.username or str(uid)
 
     # ── Админ-панель ─────────────────────────────────────────────────────────
     if data == "adm_add":
@@ -573,6 +710,54 @@ async def on_callback(query: CallbackQuery) -> None:
             "Пример: <code>123456789</code>",
             parse_mode="HTML",
         )
+        return
+
+    # ── Очередь эмодзи аппрувера ─────────────────────────────────────────────
+    if data.startswith("aq_add_"):
+        idx = int(data.split("_")[-1])
+        queue = session.pending_emoji_queue
+        if 0 <= idx < len(queue):
+            emoji_id = queue[idx]
+            session.pending_emoji_id = emoji_id
+            session.waiting_for_emoji_name = True
+            await query.answer()
+            await query.message.answer(
+                f"✏️ Введи название для эмодзи {tg_emoji_tag(emoji_id)}\n"
+                f"ID: <code>{emoji_id}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await query.answer("❌ Не найдено")
+        return
+
+    if data == "aq_close":
+        session.pending_emoji_queue = []
+        await query.answer("Закрыто")
+        await query.message.delete()
+        return
+
+    # ── Фото ─────────────────────────────────────────────────────────────────
+    if data == "photo_attach":
+        session.waiting_for_photo = True
+        await query.answer()
+        await query.message.answer(
+            "🖼️ Отправь фото для прикрепления к сообщению.\n"
+            "Или /cancel для отмены.",
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "photo_remove":
+        session.photo_file_id = None
+        session.waiting_for_photo = False
+        await query.answer("🗑️ Фото удалено")
+        # Удаляем фото-сообщение и шлём текстовое
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        session.last_message_id = None
+        await _refresh_editor(chat_id, session)
         return
 
     # ── Пикер: навигация ─────────────────────────────────────────────────────
