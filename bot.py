@@ -213,7 +213,7 @@ def build_picker_keyboard(page: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     rows.append([InlineKeyboardButton(text="❌ Без эмодзи", callback_data="ep_none")])
     pair: list[InlineKeyboardButton] = []
-    for local_idx, row in enumerate(items):
+    for local_idx, _ in enumerate(items):
         num = local_idx + 1
         btn = InlineKeyboardButton(
             text=f"Выбрать {num}",
@@ -309,7 +309,7 @@ async def _refresh_editor(chat_id: int, session: Session) -> None:
     session.last_message_id = sent.message_id
 
 # ─────────────────────────────────────────────
-#  КОМАНДЫ — регистрируем ПЕРВЫМИ
+#  Команды
 # ─────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
@@ -322,10 +322,9 @@ async def cmd_start(message: Message) -> None:
 @dp.message(Command("upuser"))
 async def cmd_upuser(message: Message) -> None:
     log.info(
-        "upuser: user=%s username=%r admins=%r check=%s",
+        "upuser: user=%s username=%r check=%s",
         message.from_user.id,
         message.from_user.username,
-        ADMINS,
         is_admin(message.from_user.username),
     )
     if not is_admin(message.from_user.username):
@@ -373,17 +372,13 @@ async def cmd_cancel(message: Message) -> None:
     await message.answer("❌ Отменено.")
 
 # ─────────────────────────────────────────────
-#  Текстовые сообщения (НЕ команды)
-#  Два раздельных хендлера вместо одного общего
+#  Хендлер: сообщения с premium emoji
 # ─────────────────────────────────────────────
-
 def _has_custom_emoji(message: Message) -> bool:
-    """Проверяем наличие custom_emoji entity."""
     if not message.entities:
         return False
     return any(e.type == "custom_emoji" for e in message.entities)
 
-# Хендлер 1: сообщения с premium emoji
 @dp.message(F.text, F.func(_has_custom_emoji))
 async def on_premium_emoji(message: Message) -> None:
     uid = message.from_user.id
@@ -415,7 +410,9 @@ async def on_premium_emoji(message: Message) -> None:
 
     await message.answer(f"ID: <code>{emoji_id}</code>", parse_mode="HTML")
 
-# Хендлер 2: обычный текст (без custom emoji)
+# ─────────────────────────────────────────────
+#  Хендлер: обычный текст
+# ─────────────────────────────────────────────
 @dp.message(F.text)
 async def on_text(message: Message) -> None:
     uid      = message.from_user.id
@@ -435,34 +432,67 @@ async def on_text(message: Message) -> None:
             )
         return
 
-    # 2. Ожидание username нового аппрувера
+    # 2. Ожидание добавления аппрувера
     if uid in admin_waiting_add:
+        parts_input = text.strip().split()
+        try:
+            target_id = int(parts_input[0])
+        except (ValueError, IndexError):
+            await message.answer(
+                "❌ Неверный формат.\n\n"
+                "Введи ID и username через пробел:\n"
+                "<code>123456789 username</code>\n\n"
+                "Или только ID:\n"
+                "<code>123456789</code>",
+                parse_mode="HTML",
+            )
+            # Оставляем в режиме ожидания
+            return
+        target_username = parts_input[1].lstrip("@") if len(parts_input) > 1 else ""
         admin_waiting_add.discard(uid)
-        target_username = text.lstrip("@")
+        db_add_approver(target_id, target_username, username or str(uid))
+        uname_display = f"@{target_username}" if target_username else "без username"
         await message.answer(
-            f"⚠️ Я не могу получить ID пользователя по username автоматически.\n"
-            f"Попроси <b>@{target_username}</b> написать боту — узнай его числовой ID "
-            f"и добавь через панель, введя ID напрямую.\n\n"
-            f"Или введи сразу числовой ID через кнопку <b>«Добавить»</b> ещё раз — "
-            f"только сначала получи ID (например, из /upuser после того как человек напишет боту).",
+            f"✅ Аппрувер добавлен!\n"
+            f"ID: <code>{target_id}</code>\n"
+            f"Username: {uname_display}",
             parse_mode="HTML",
         )
-        await message.answer(build_upuser_text(), reply_markup=build_upuser_keyboard(), parse_mode="HTML")
+        await message.answer(
+            build_upuser_text(),
+            reply_markup=build_upuser_keyboard(),
+            parse_mode="HTML",
+        )
         return
 
     # 3. Ожидание ID для удаления
     if uid in admin_waiting_remove:
-        admin_waiting_remove.discard(uid)
         try:
-            target_id = int(text)
+            target_id = int(text.strip())
         except ValueError:
-            await message.answer("❌ Нужен числовой ID.")
+            await message.answer(
+                "❌ Нужен числовой ID.\n"
+                "Пример: <code>123456789</code>",
+                parse_mode="HTML",
+            )
+            # Оставляем в режиме ожидания
             return
+        admin_waiting_remove.discard(uid)
         if db_remove_approver(target_id):
-            await message.answer(f"✅ Аппрувер <code>{target_id}</code> удалён.", parse_mode="HTML")
+            await message.answer(
+                f"✅ Аппрувер <code>{target_id}</code> удалён.",
+                parse_mode="HTML",
+            )
         else:
-            await message.answer(f"❌ Аппрувер с ID <code>{target_id}</code> не найден.", parse_mode="HTML")
-        await message.answer(build_upuser_text(), reply_markup=build_upuser_keyboard(), parse_mode="HTML")
+            await message.answer(
+                f"❌ Аппрувер с ID <code>{target_id}</code> не найден.",
+                parse_mode="HTML",
+            )
+        await message.answer(
+            build_upuser_text(),
+            reply_markup=build_upuser_keyboard(),
+            parse_mode="HTML",
+        )
         return
 
     # 4. Ожидание названия эмодзи (аппрувер)
@@ -508,7 +538,7 @@ async def on_callback(query: CallbackQuery) -> None:
     chat_id = query.message.chat.id
     session = get_session(uid)
 
-    # Админ-панель
+    # ── Админ-панель ─────────────────────────────────────────────────────────
     if data == "adm_add":
         if not is_admin(query.from_user.username):
             await query.answer("⛔ Нет доступа.")
@@ -516,8 +546,10 @@ async def on_callback(query: CallbackQuery) -> None:
         admin_waiting_add.add(uid)
         await query.answer()
         await query.message.answer(
-            "👤 Введи числовой <b>user_id</b> нового аппрувера и его username через пробел.\n"
-            "Например: <code>123456789 username</code>",
+            "👤 Введи ID аппрувера и username через пробел:\n"
+            "<code>123456789 username</code>\n\n"
+            "Или только ID:\n"
+            "<code>123456789</code>",
             parse_mode="HTML",
         )
         return
@@ -529,12 +561,13 @@ async def on_callback(query: CallbackQuery) -> None:
         admin_waiting_remove.add(uid)
         await query.answer()
         await query.message.answer(
-            "🗑 Введи числовой <b>user_id</b> аппрувера для удаления:",
+            "🗑 Введи числовой <b>user_id</b> аппрувера для удаления:\n"
+            "Пример: <code>123456789</code>",
             parse_mode="HTML",
         )
         return
 
-    # Пикер: навигация
+    # ── Пикер: навигация ─────────────────────────────────────────────────────
     if data.startswith("ep_page_"):
         new_page = int(data.split("_")[-1])
         session.emoji_page = new_page
@@ -587,7 +620,7 @@ async def on_callback(query: CallbackQuery) -> None:
         await _refresh_editor(chat_id, session)
         return
 
-    # Редактор
+    # ── Редактор ─────────────────────────────────────────────────────────────
     if data == "add":
         extras = len(session.parts) - 1
         if extras >= MAX_ADDITIONS:
